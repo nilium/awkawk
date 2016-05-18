@@ -2,12 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -21,7 +22,12 @@ func nrand(min, max int) int {
 		max, min = min, max
 	}
 
-	return min + rand.Intn(max-min)
+	top := big.NewInt(int64(max - min))
+	n, err := rand.Int(rand.Reader, top)
+	if err != nil {
+		return (min + max) / 2 // Fair guess: half. What could go wrong?
+	}
+	return min + int(n.Int64())
 }
 
 func any(of []string) string {
@@ -31,7 +37,7 @@ func any(of []string) string {
 	case 1:
 		return of[0]
 	default:
-		return of[rand.Intn(N-1)]
+		return of[nrand(0, N-1)]
 	}
 }
 
