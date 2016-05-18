@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"text/template"
 )
@@ -169,9 +170,11 @@ var appendages = []string{
 	"third nipple",
 	"torso",
 	"wrist",
+	"inherited donkey",
 }
 
 var funcs = template.FuncMap{
+	"bt":   func() string { return "`" },
 	"rand": nrand,
 	"any":  any,
 	"list": list,
@@ -195,22 +198,68 @@ var funcs = template.FuncMap{
 
 		return bits[from:to], nil
 	},
-	"appendages": func() []string {
-		return appendages
-	},
 	"adjectives": func(n int) []string {
 		if n <= 1 {
 			return singularAdjectives
 		}
 		return pluralAdjectives
 	},
+	"enumerate": enumerate,
+}
+
+func enumerate(andor string, things []string) string {
+	andor = strings.TrimSpace(andor)
+	if len(andor) > 1 {
+		andor += " "
+	}
+
+	n := len(things)
+	switch n {
+	case 0:
+		return ""
+	case 1:
+		return things[0]
+	case 2:
+		if andor == "" {
+			andor = ", "
+		} else {
+			andor = " " + andor
+		}
+		return things[0] + andor + things[1]
+	default:
+		return strings.Join(things[:n-1], ", ") + ", " + andor + things[n-1]
+	}
 }
 
 var commands = map[string]*template.Template{
-	"grackle":  template.Must(template.New("grackle").Funcs(funcs).Parse(`impales {{ .target }} through the {{ appendages | any }} with a high-velocity grackle. AWK AWK!`)),
-	"flamingo": template.Must(template.New("flamingo").Funcs(funcs).Parse(`smacks {{ .target }} upside the {{ appendages | any }} with a {{ adjectives 1 | any }} flamingo.`)),
-	"trout":    template.Must(template.New("trout").Funcs(funcs).Parse(`slaps {{ .target }} around a bit with a {{ adjectives 1 | any }} trout.`)),
-	"cat":      template.Must(template.New("cat").Funcs(funcs).Parse(`{{ $n := rand 1 60 }}straps {{ if eq $n 1 }}a{{ else }}{{ print $n }}{{ end }} {{ adjectives $n | any }} cat{{ if ne $n 1 }}s{{ end }} to {{ .target }}.`)),
+	// Acceptable context is defined by the flatValues anonymous struct in handleAwk
+	"help": template.Must(template.New("help").Funcs(funcs).Parse(
+		`{{bt}}/awkawk [means] [victim]{{bt}} - {{bt}}[means]{{bt}} may be one of {{enumerate "or" .CommandNames}}. The {{bt}}[victim]{{bt}} is pitiable.`,
+	)),
+	"grackle": template.Must(template.New("grackle").Funcs(funcs).Parse(
+		`impales {{ .Target }} through the {{ .Appendages | any }} with a high-velocity grackle. AWK AWK MOTHA-FUCKA!`,
+	)),
+	"flamingo": template.Must(template.New("flamingo").Funcs(funcs).Parse(
+		`smacks {{ .Target }} upside the {{ .Appendages | any }} with a {{ adjectives 1 | any }} flamingo.`,
+	)),
+	"trout": template.Must(template.New("trout").Funcs(funcs).Parse(
+		`slaps {{ .Target }} around a bit with a {{ adjectives 1 | any }} trout.`,
+	)),
+	"cat": template.Must(template.New("cat").Funcs(funcs).Parse(
+		`{{ $n := rand 1 60 }}straps {{ if eq $n 1 }}a{{ else }}{{ print $n }}{{ end }} {{ adjectives $n | any }} cat{{ if ne $n 1 }}s{{ end }} to {{ .Target }}.`,
+	)),
+}
+
+var cmdnames []string
+
+func init() {
+	for k := range commands {
+		if k == "help" {
+			continue
+		}
+		cmdnames = append(cmdnames, k)
+	}
+	sort.Strings(cmdnames)
 }
 
 func handleAwk(w http.ResponseWriter, r *http.Request) {
@@ -234,27 +283,46 @@ func handleAwk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flatValues := make(map[string]string, len(r.Form))
-	for k, ary := range r.Form {
-		flatValues[k] = strings.Join(ary, " ")
+	flatValues := struct {
+		Flat         map[string]string
+		Form         map[string][]string
+		Target       string
+		Means        string
+		CommandNames []string
+		PluralAdj    []string
+		SingularAdj  []string
+		Adj          []string
+		Appendages   []string
+	}{
+		Flat:         make(map[string]string, len(r.Form)),
+		Form:         r.Form,
+		CommandNames: cmdnames,
+		PluralAdj:    pluralAdjectives,
+		SingularAdj:  singularAdjectives,
+		Adj:          adjectives,
+		Appendages:   appendages,
 	}
 
-	cmd := strings.Fields(flatValues["text"])
+	for k, ary := range r.Form {
+		flatValues.Flat[k] = strings.Join(ary, " ")
+	}
+
+	cmd := strings.Fields(flatValues.Flat["text"])
 	if len(cmd) == 0 {
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, "no command given")
 		return
 	}
 
-	tx, ok := commands[cmd[0]]
+	flatValues.Means = cmd[0]
+	tx, ok := commands[flatValues.Means]
 	if !ok {
 		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, "invalid command %q", cmd[0])
+		fmt.Fprintf(w, "unknown command %q", cmd[0])
 		return
 	}
 
-	target := strings.Join(cmd[1:], " ")
-	flatValues["target"] = target
+	flatValues.Target = strings.Join(cmd[1:], " ")
 
 	var buf bytes.Buffer
 	if err := tx.ExecuteTemplate(&buf, cmd[0], flatValues); err != nil {
