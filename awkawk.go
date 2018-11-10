@@ -5,16 +5,39 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"text/template"
+
+	"github.com/golang/glog"
 )
+
+func ellipsize(s string, maxLen int) string {
+	if len(s) < maxLen {
+		return s
+	}
+
+	// Try to avoid ellipsizing mid-character
+	tip := 0
+	for i := range s {
+		if i > maxLen {
+			break
+		}
+		tip = i
+	}
+
+	return s[:tip] + "..."
+}
 
 var token = os.Getenv("TOKEN")
 
@@ -262,30 +285,37 @@ func init() {
 	sort.Strings(cmdnames)
 }
 
+func replyWithError(w http.ResponseWriter, code int, format string, args ...interface{}) {
+	msg := strconv.Itoa(code) + " " + fmt.Sprintf(format, args...) + "\n"
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(msg)))
+	w.WriteHeader(code)
+	// Ignore any error from writing to w
+	io.WriteString(w, msg)
+}
+
 func handleAwk(w http.ResponseWriter, r *http.Request) {
+	const maxFormLength = 1000
+
 	if err := r.ParseForm(); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		replyWithError(w, http.StatusBadRequest, "bad request")
 		return
 	}
 
 	if len(token) > 0 && token != r.FormValue("token") {
-		w.WriteHeader(http.StatusNotFound)
+		replyWithError(w, http.StatusNotFound, "page not found")
 		return
 	}
 
 	if cmd := r.FormValue("command"); cmd == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, "no command given")
+		replyWithError(w, http.StatusBadRequest, "no command")
 		return
 	} else if cmd != "/awkawk" {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "awkawk: expected command /awkawk, got %q", cmd)
+		replyWithError(w, http.StatusBadRequest, "unrecognized command: %q", ellipsize(cmd, 30))
 		return
 	}
 
 	flatValues := struct {
-		Flat         map[string]string
-		Form         map[string][]string
 		Target       string
 		Means        string
 		CommandNames []string
@@ -294,8 +324,6 @@ func handleAwk(w http.ResponseWriter, r *http.Request) {
 		Adj          []string
 		Appendages   []string
 	}{
-		Flat:         make(map[string]string, len(r.Form)),
-		Form:         r.Form,
 		CommandNames: cmdnames,
 		PluralAdj:    pluralAdjectives,
 		SingularAdj:  singularAdjectives,
@@ -303,22 +331,16 @@ func handleAwk(w http.ResponseWriter, r *http.Request) {
 		Appendages:   appendages,
 	}
 
-	for k, ary := range r.Form {
-		flatValues.Flat[k] = strings.Join(ary, " ")
-	}
-
-	cmd := strings.Fields(flatValues.Flat["text"])
+	cmd := strings.Fields(r.Form.Get("text"))
 	if len(cmd) == 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, "no command given")
+		replyWithError(w, http.StatusBadRequest, "no command string")
 		return
 	}
 
 	flatValues.Means = cmd[0]
 	tx, ok := commands[flatValues.Means]
 	if !ok {
-		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, "unknown command %q", cmd[0])
+		replyWithError(w, http.StatusBadRequest, "unrecognized means: %q", ellipsize(cmd[0], 30))
 		return
 	}
 
@@ -326,8 +348,8 @@ func handleAwk(w http.ResponseWriter, r *http.Request) {
 
 	var buf bytes.Buffer
 	if err := tx.ExecuteTemplate(&buf, cmd[0], flatValues); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "error: %v", err)
+		replyWithError(w, http.StatusInternalServerError, "error rendering response: %v", err)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -335,7 +357,7 @@ func handleAwk(w http.ResponseWriter, r *http.Request) {
 		Type: "in_channel",
 		Text: buf.String(),
 	}); err != nil {
-		log.Println("error encoding JSON:", err)
+		glog.Warningf("Error encoding JSON: %v", err)
 	}
 }
 
@@ -344,10 +366,62 @@ type Always int
 func (a Always) ServeHTTP(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(int(a)) }
 
 func main() {
-	http.HandleFunc("/", handleAwk)
-	http.Handle("/_health", Always(http.StatusOK))
+	flag.Parse()
 
-	if err := http.ListenAndServe(os.Getenv("LISTEN"), nil); err != nil {
-		panic(err)
+	listenAddr := os.Getenv("LISTEN")
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:9001"
 	}
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		glog.Fatalf("Unable to create listener: %v", err)
+	}
+	glog.Infof("Listening on %v", listener.Addr())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleAwk)
+	// The healthz endpoint is only necessary for health-checking systems that can't check if
+	// the requested port is open
+	mux.Handle("/healthz", Always(http.StatusOK))
+
+	sv := &http.Server{
+		Handler: mux,
+	}
+
+	done := make(chan struct{})
+
+	// Start server
+	go func() {
+		defer close(done)
+		glog.Info("Starting server")
+		if err := sv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			glog.Fatalf("Fatal server error: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	go func() {
+		note := <-waitForSignal(os.Interrupt, syscall.SIGTERM)
+		glog.Infof("Received %v; shutting down", note)
+		if err := sv.Close(); err != nil {
+			// Just die right now.
+			glog.Errorf("Error closing server: %v", err)
+			panic(err)
+		}
+	}()
+
+	<-done
+	glog.Info("Goodbye")
+}
+
+func waitForSignal(signals ...os.Signal) <-chan os.Signal {
+	out := make(chan os.Signal)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, signals...)
+	go func() {
+		defer signal.Stop(ch)
+		out <- (<-ch)
+		close(out)
+	}()
+	return out
 }
